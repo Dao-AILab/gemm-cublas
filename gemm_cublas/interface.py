@@ -112,7 +112,6 @@ class LinearFunc(torch.autograd.Function):
         x: (..., in_features)
         weight: (out_features, in_features)
         out: (..., out_features)
-        Caution: fuse_grad_accum is not compatible with torch.compile
         """
         needs_weight_grad = weight.requires_grad
         needs_input_grad = x.requires_grad
@@ -157,7 +156,8 @@ class LinearFunc(torch.autograd.Function):
         if ctx.needs_input_grad[1]:
             assert x is not None
             x = x.reshape(batch_dim, x.shape[-1])
-            if not ctx.fuse_grad_accum or weight_og.grad is None:
+            # fuse_grad_accum is not compatible with torch.compile
+            if not ctx.fuse_grad_accum or weight_og.grad is None or torch.compiler.is_compiling():
                 dweight = gemm_t(dout, x, out_dtype=ctx.weight_dtype)
             else:
                 gemm_t_add_(dout, x, weight_og.grad)
@@ -183,8 +183,6 @@ class Linear(nn.Linear):
         dtype=None,
         fuse_grad_accum: bool = False,
     ) -> None:
-        """ Caution: fuse_grad_accum is not compatible with torch.compile
-        """
         super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
         self.fuse_grad_accum = fuse_grad_accum
 

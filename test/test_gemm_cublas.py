@@ -59,8 +59,6 @@ def test_gemm(k, n, A_rowmajor, B_rowmajor, has_c, has_out, input_dtype):
 # @pytest.mark.parametrize("out_features", [1024])
 # @pytest.mark.parametrize("in_features", [1024])
 def test_linear(in_features, out_features, has_bias, amp, compiled, fuse_grad_accum, dtype):
-    if fuse_grad_accum and compiled:
-        pytest.skip("fuse_grad_accum is not compatible with torch.compile")
     if compiled:  # Don't fall back to eager just bc of recompilation
         torch._dynamo.config.recompile_limit = 2 ** 31
     device = "cuda"
