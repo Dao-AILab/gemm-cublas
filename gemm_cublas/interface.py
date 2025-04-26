@@ -114,61 +114,58 @@ class LinearFunc(torch.autograd.Function):
         out: (..., out_features)
         Caution: fuse_grad_accum is not compatible with torch.compile
         """
-        ctx.compute_weight_gradient = weight.requires_grad
+        needs_weight_grad = weight.requires_grad
+        needs_input_grad = x.requires_grad
+        ctx.weight_dtype = weight.dtype
         autocast_dtype = torch.get_autocast_dtype("cuda")
         if torch.is_autocast_enabled():
             x = x.to(dtype=autocast_dtype)
-        ctx.weight_dtype = weight.dtype
         weight_og = weight
         if torch.is_autocast_enabled():
             weight = weight.to(dtype=autocast_dtype)
         out = F.linear(x, weight)
-        if ctx.compute_weight_gradient:
-            if not fuse_grad_accum:
-                ctx.save_for_backward(x, weight)
-            else:
-                ctx.save_for_backward(x, weight, weight_og)
+        if not needs_input_grad:
+            weight, weight_og = None, None
+        if not needs_weight_grad:
+            x = None
+        if not fuse_grad_accum:
+            ctx.save_for_backward(x, weight)
         else:
-            ctx.save_for_backward(weight)
+            ctx.save_for_backward(x, weight, weight_og)
         ctx.fuse_grad_accum = fuse_grad_accum
-        ctx.weight_og_dtype = weight_og.dtype
         return out
 
     @staticmethod
     @custom_bwd(device_type="cuda")
-    def backward(ctx, dout, *args):
+    def backward(ctx, dout):
         """
         dout: (..., out_features)
         """
-        if ctx.compute_weight_gradient:
-            if not ctx.fuse_grad_accum:
-                x, weight = ctx.saved_tensors
-            else:
-                x, weight, weight_og = ctx.saved_tensors
+        if not ctx.fuse_grad_accum:
+            x, weight = ctx.saved_tensors
         else:
-            weight, = ctx.saved_tensors
-            x = None
+            x, weight, weight_og = ctx.saved_tensors
         batch_shape = dout.shape[:-1]
         batch_dim = batch_shape.numel()
         dout = dout.reshape(batch_dim, dout.shape[-1])
-        x = x.reshape(batch_dim, x.shape[-1])
         if ctx.needs_input_grad[0]:
+            assert weight is not None
             dx = dout @ weight
             dx = dx.reshape(*batch_shape, dx.shape[-1])
         else:
             dx = None
         if ctx.needs_input_grad[1]:
-            assert ctx.compute_weight_gradient
             assert x is not None
+            x = x.reshape(batch_dim, x.shape[-1])
             if not ctx.fuse_grad_accum or weight_og.grad is None:
-                dweight = gemm_t(dout, x, out_dtype=ctx.weight_og_dtype)
+                dweight = gemm_t(dout, x, out_dtype=ctx.weight_dtype)
             else:
                 gemm_t_add_(dout, x, weight_og.grad)
                 dweight = weight_og.grad
                 weight_og.grad = None  # So that pytorch doesn't add dweight to weight_og.grad again
         else:
             dweight = None
-        return dx, dweight, None, None, None
+        return dx, dweight, None
 
 
 def linear_func(x, weight, fuse_grad_accum=False):
