@@ -2,4 +2,4 @@
 __version__ = "0.1.0"
 
 from . import _C
-from .interface import gemm, gemm_t, gemm_t_add_, gemm_ref, Linear
+from .interface import gemm_out, gemm, gemm_out_ref, Linear

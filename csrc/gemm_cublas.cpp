@@ -86,7 +86,7 @@ gemm_impl(const at::Tensor& A_, const at::Tensor& B_,
   auto opts = A.options();
   if (!out_.has_value()) {
     auto out_type = C_.has_value() ? C_.value().scalar_type() : out_dtype_.value_or(input_type);
-    out = at::empty({n, m}, opts.dtype(out_type)).transpose(0, 1);  // Colmajor
+    out = at::empty_strided({m, n}, {1, m}, opts.dtype(out_type));  // Colmajor
   } else {
     out = out_.value();
     TORCH_CHECK(out.scalar_type() == input_type || out.scalar_type() == at::ScalarType::Float, "out must be of the same type as A and B, or of type FP32");

@@ -49,7 +49,7 @@ def gemm_impl_ref(
     return out if out_given is None else None
 
 
-def gemm(
+def gemm_out(
     A: Tensor, B: Tensor, C: Optional[Tensor] = None, out: Optional[Tensor] = None,
     out_dtype: Optional[torch.dtype] = None, heuristic: int = -1,
 ) -> Tensor:
@@ -65,47 +65,47 @@ def gemm(
     return out if out is not None else out_optional
 
 
-def gemm_ref(A: Tensor, B: Tensor, C: Optional[Tensor] = None, out: Optional[Tensor] = None) -> Tensor:
+def gemm_out_ref(A: Tensor, B: Tensor, C: Optional[Tensor] = None, out: Optional[Tensor] = None) -> Tensor:
     out_optional = gemm_impl_ref(A, B, C, out)
     return out if out is not None else out_optional
 
 
-@torch.library.custom_op("gemm_cublas::gemm_t", mutates_args={})
-def gemm_t(A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None) -> Tensor:
-    return gemm(A.T, B, out_dtype=out_dtype)
+@torch.library.custom_op("gemm_cublas::gemm", mutates_args={})
+def gemm(A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None) -> Tensor:
+    return gemm_out(A, B, out_dtype=out_dtype)
 
 
-@torch.library.register_fake("gemm_cublas::gemm_t")
-def gemm_t_ref(A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None) -> Tensor:
-    return torch.mm(A.T, B).to(out_dtype if out_dtype is not None else A.dtype)
+@torch.library.register_fake("gemm_cublas::gemm")
+def gemm_ref(A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None) -> Tensor:
+    return torch.mm(A, B).to(out_dtype if out_dtype is not None else A.dtype)
 
 
-@torch.library.custom_op("gemm_cublas::gemm_t_add", mutates_args={})
-def gemm_t_add(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
-    return gemm(A.T, B, C)
+@torch.library.custom_op("gemm_cublas::gemm_add", mutates_args={})
+def gemm_add(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
+    return gemm_out(A.T, B, C)
 
 
-@torch.library.register_fake("gemm_cublas::gemm_t_add")
-def gemm_t_add_ref(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
-    return C + torch.mm(A.T, B).to(C.dtype)
+@torch.library.register_fake("gemm_cublas::gemm_add")
+def gemm_add_ref(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
+    return C + torch.mm(A, B).to(C.dtype)
 
 
-@torch.library.custom_op("gemm_cublas::gemm_t_add_", mutates_args={"C"},
+@torch.library.custom_op("gemm_cublas::gemm_add_", mutates_args={"C"},
                          schema="(Tensor A, Tensor B, Tensor(a!) C) -> ()")
-def gemm_t_add_(A: Tensor, B: Tensor, C: Tensor) -> ():  # In-place, will modify C
-    gemm(A.T, B, C, out=C)
+def gemm_add_(A: Tensor, B: Tensor, C: Tensor) -> ():  # In-place, will modify C
+    gemm_out(A, B, C, out=C)
 
 
-@torch.library.register_fake("gemm_cublas::gemm_t_add_")
-def gemm_t_add_inplace_ref(A: Tensor, B: Tensor, C: Tensor) -> ():
-    C.add_(torch.mm(A.T, B).to(C.dtype))
+@torch.library.register_fake("gemm_cublas::gemm_add_")
+def gemm_add_inplace_ref(A: Tensor, B: Tensor, C: Tensor) -> ():
+    C.add_(torch.mm(A, B).to(C.dtype))
 
 
 try:
     from torch._inductor.fx_passes.reinplace import InplaceableOp
     torch._inductor.fx_passes.reinplace.inplaceable_ops.update({
-        torch.ops.gemm_cublas.gemm_t_add.default:
-        InplaceableOp(torch.ops.gemm_cublas.gemm_t_add_.default, mutated_arg=2)
+        torch.ops.gemm_cublas.gemm_add.default:
+        InplaceableOp(torch.ops.gemm_cublas.gemm_add_.default, mutated_arg=2)
     })
 except ImportError:
     pass
@@ -166,9 +166,9 @@ class LinearFunc(torch.autograd.Function):
             x = x.reshape(batch_dim, x.shape[-1])
             # fuse_grad_accum is not compatible with torch.compile
             if not ctx.fuse_grad_accum or weight_og.grad is None or torch.compiler.is_compiling():
-                dweight = gemm_t(dout, x, out_dtype=ctx.weight_dtype)
+                dweight = gemm(dout.T, x, out_dtype=ctx.weight_dtype)
             else:
-                gemm_t_add_(dout, x, weight_og.grad)
+                gemm_add_(dout.T, x, weight_og.grad)
                 dweight = weight_og.grad
                 weight_og.grad = None  # So that pytorch doesn't add dweight to weight_og.grad again
         else:

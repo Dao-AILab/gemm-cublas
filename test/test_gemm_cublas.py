@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from gemm_cublas import gemm, gemm_ref
+from gemm_cublas import gemm_out, gemm_out_ref
 from gemm_cublas import Linear as LinearCB
 
 
@@ -37,9 +37,9 @@ def test_gemm(k, n, A_rowmajor, B_rowmajor, has_c, has_out, input_dtype):
             out_given = None
         torch.library.opcheck(torch.ops.gemm_cublas.gemm_impl, args=(A, B),
                               kwargs=dict(C=C, out=out_given))
-        out = gemm(A, B, C=C, out=out_given)
-        out_ref = gemm_ref(A.double(), B.double(), C=C.double() if C is not None else C)
-        out_pt = gemm_ref(A, B, C=C, out=out_given.clone()if out_given is not None else None)
+        out = gemm_out(A, B, C=C, out=out_given)
+        out_ref = gemm_out_ref(A.double(), B.double(), C=C.double() if C is not None else C)
+        out_pt = gemm_out_ref(A, B, C=C, out=out_given.clone()if out_given is not None else None)
         assert out.dtype == out_pt.dtype
         assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-6
         if has_out:
