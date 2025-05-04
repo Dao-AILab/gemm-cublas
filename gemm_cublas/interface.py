@@ -8,12 +8,17 @@ from torch import Tensor
 from torch.amp import custom_bwd, custom_fwd
 
 
-@torch.library.register_fake("gemm_cublas::gemm_out")
-def gemm_out_ref(A: Tensor, B: Tensor, out: Tensor, C: Optional[Tensor] = None) -> ():
+@torch.library.register_fake("gemm_cublas::gemm_impl")
+def gemm_impl_ref(
+    A: Tensor, B: Tensor, C: Optional[Tensor] = None,
+    out: Optional[Tensor] = None, out_dtype: Optional[torch.dtype] = None,
+    heuristic: int = -1
+) -> Tensor:
     """
     Perform matrix multiplication of A and B, with optional bias C.
     If C is provided, it will be added to the result of the matrix multiplication.
     """
+    out_given = out
     torch._check(A.ndim == 2)
     torch._check(B.ndim == 2)
     m, k = A.shape
@@ -21,49 +26,53 @@ def gemm_out_ref(A: Tensor, B: Tensor, out: Tensor, C: Optional[Tensor] = None) 
     torch._check(k == B.shape[0])
     torch._check(A.dtype == B.dtype)
     torch._check(A.dtype in [torch.float64, torch.float32, torch.float16, torch.bfloat16])
+    if out is None:
+        out = torch.empty(
+            m, n, device=A.device,
+            dtype=C.dtype if C is not None else (out_dtype if out_dtype is not None else A.dtype),
+        )
+    else:
+        torch._check(out.shape == (m, n))
+        torch._check(out.device == A.device)
+        torch._check(out.dtype in [A.dtype, torch.float])
     if C is not None:
         torch._check(C.shape == (m, n))
         torch._check(C.device == A.device)
         torch._check(C.dtype in [A.dtype, torch.float])
         C = C.to(A.dtype)
-    torch._check(out.shape == (m, n))
-    torch._check(out.device == A.device)
-    torch._check(out.dtype in [A.dtype, torch.float])
     if out.dtype != A.dtype:
         result = A @ B if C is None else torch.addmm(C, A, B)
     else:
         result = torch.mm(A, B, out=out) if C is None else torch.addmm(C, A, B, out=out)
     if out.dtype != A.dtype:
         out.copy_(result)
+    return out if out_given is None else None
 
 
-def gemm_ref(A: Tensor, B: Tensor, C: Optional[Tensor] = None, out: Optional[Tensor] = None) -> Tensor:
-    if out is None:
-        out = torch.empty(A.shape[0], B.shape[1], dtype=A.dtype if C is None else C.dtype,
-                          device=A.device)
-    gemm_out_ref(A, B, out, C)
-    return out
-
-
-def gemm_out(A: Tensor, B: Tensor, out: Tensor, C: Optional[Tensor] = None) -> ():
-    """
-    Perform matrix multiplication of A and B, with optional bias C.
-    If C is provided, it will be added to the result of the matrix multiplication.
-    """
-    torch.ops.gemm_cublas.gemm_out.default(A, B, out, C)
-
-
-def gemm(A: Tensor, B: Tensor, C: Optional[Tensor] = None, out: Optional[Tensor] = None) -> Tensor:
+def gemm(
+    A: Tensor, B: Tensor, C: Optional[Tensor] = None, out: Optional[Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None, heuristic: int = -1,
+) -> Tensor:
     """
     Perform matrix multiplication of A and B, with optional bias C.
     If C is provided, it will be added to the result of the matrix multiplication.
     The result will be stored in out if provided, otherwise A new tensor will be created.
     """
-    if out is None:
-        out = torch.empty(A.shape[0], B.shape[1], dtype=A.dtype if C is None else C.dtype,
-                          device=A.device)
-    gemm_out(A, B, out, C)
-    return out
+    # We need to wrap the call to gemm_impl since torch.library doesn't like it when
+    # we return a tensor that aliases the input tensor.
+    # When out is provided, gemm_impl will return None, so we need to return out.
+    out_optional = torch.ops.gemm_cublas.gemm_impl.default(A, B, C, out, out_dtype, heuristic)
+    return out if out is not None else out_optional
+
+
+def gemm_ref(A: Tensor, B: Tensor, C: Optional[Tensor] = None, out: Optional[Tensor] = None) -> Tensor:
+    out_optional = gemm_impl_ref(A, B, C, out)
+    return out if out is not None else out_optional
+
+
+@torch.library.custom_op("gemm_cublas::gemm_t", mutates_args={})
+def gemm_t(A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None) -> Tensor:
+    return gemm(A.T, B, out_dtype=out_dtype)
 
 
 @torch.library.register_fake("gemm_cublas::gemm_t")
@@ -71,8 +80,9 @@ def gemm_t_ref(A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None) ->
     return torch.mm(A.T, B).to(out_dtype if out_dtype is not None else A.dtype)
 
 
-def gemm_t(A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None) -> Tensor:
-    return torch.ops.gemm_cublas.gemm_t.default(A, B, out_dtype)
+@torch.library.custom_op("gemm_cublas::gemm_t_add", mutates_args={})
+def gemm_t_add(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
+    return gemm(A.T, B, C)
 
 
 @torch.library.register_fake("gemm_cublas::gemm_t_add")
@@ -80,17 +90,15 @@ def gemm_t_add_ref(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
     return C + torch.mm(A.T, B).to(C.dtype)
 
 
-def gemm_t_add(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
-    return torch.ops.gemm_cublas.gemm_t_add.default(A, B, C)
+@torch.library.custom_op("gemm_cublas::gemm_t_add_", mutates_args={"C"},
+                         schema="(Tensor A, Tensor B, Tensor(a!) C) -> ()")
+def gemm_t_add_(A: Tensor, B: Tensor, C: Tensor) -> ():  # In-place, will modify C
+    gemm(A.T, B, C, out=C)
 
 
 @torch.library.register_fake("gemm_cublas::gemm_t_add_")
 def gemm_t_add_inplace_ref(A: Tensor, B: Tensor, C: Tensor) -> ():
     C.add_(torch.mm(A.T, B).to(C.dtype))
-
-
-def gemm_t_add_(A: Tensor, B: Tensor, C: Tensor) -> ():  # In-place, will modify C
-    torch.ops.gemm_cublas.gemm_t_add_.default(A, B, C)
 
 
 try:

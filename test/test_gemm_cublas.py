@@ -8,11 +8,11 @@ from gemm_cublas import Linear as LinearCB
 
 
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16, torch.float32])
-# @pytest.mark.parametrize("input_dtype", [torch.float32])
+# @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("has_out", [False, True])
-# @pytest.mark.parametrize("has_out", [False])
+# @pytest.mark.parametrize("has_out", [True])
 @pytest.mark.parametrize("has_c", [False, True])
-# @pytest.mark.parametrize("has_c", [True])
+# @pytest.mark.parametrize("has_c", [False])
 @pytest.mark.parametrize("B_rowmajor", [False, True])
 # @pytest.mark.parametrize("B_rowmajor", [True])
 @pytest.mark.parametrize("A_rowmajor", [False, True])
@@ -20,7 +20,7 @@ from gemm_cublas import Linear as LinearCB
 @pytest.mark.parametrize("n", [1481, 4096])
 @pytest.mark.parametrize("k", [732, 4096])
 # @pytest.mark.parametrize("n", [4096])
-# @pytest.mark.parametrize("k", [4096])
+# @pytest.mark.parametrize("k", [2048])
 def test_gemm(k, n, A_rowmajor, B_rowmajor, has_c, has_out, input_dtype):
     device = "cuda"
     torch.random.manual_seed(0)
@@ -35,11 +35,12 @@ def test_gemm(k, n, A_rowmajor, B_rowmajor, has_c, has_out, input_dtype):
             out_given = torch.empty((m, n), device=device, dtype=out_dtype)
         else:
             out_given = None
-        if has_out:
-            torch.library.opcheck(torch.ops.gemm_cublas.gemm_out, args=(A, B, out_given), kwargs=dict(C=C))
+        torch.library.opcheck(torch.ops.gemm_cublas.gemm_impl, args=(A, B),
+                              kwargs=dict(C=C, out=out_given))
         out = gemm(A, B, C=C, out=out_given)
         out_ref = gemm_ref(A.double(), B.double(), C=C.double() if C is not None else C)
-        out_pt = gemm_ref(A, B, C=C)
+        out_pt = gemm_ref(A, B, C=C, out=out_given.clone()if out_given is not None else None)
+        assert out.dtype == out_pt.dtype
         assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-6
         if has_out:
             assert torch.equal(out, out_given)

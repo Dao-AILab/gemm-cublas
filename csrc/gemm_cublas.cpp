@@ -43,9 +43,16 @@ uint32_t _getAlignment(uintptr_t address) {
   }
 }
 
-void gemm_out(const at::Tensor& A_, const at::Tensor& B_, at::Tensor out,
-              std::optional<at::Tensor> C_) {
-  bool C_rowmajor = out.stride(1) == 1;
+at::Tensor
+gemm_impl(const at::Tensor& A_, const at::Tensor& B_,
+          std::optional<at::Tensor> C_=std::nullopt,
+          std::optional<at::Tensor> out_=std::nullopt,
+          std::optional<at::ScalarType> out_dtype_=std::nullopt,
+          int64_t heuristic_=-1) {
+  int heuristic = heuristic_;
+  bool C_rowmajor = out_.has_value()
+    ? out_.value().stride(1) == 1
+    : (C_.has_value() ? C_.value().stride(1) == 1 : true);
   // If C_rowmajor, instead of compute out = A @ B, we compute out.T = B.T @ A.T
   at::Tensor A = !C_rowmajor ? A_ : B_.transpose(0, 1);
   at::Tensor B = !C_rowmajor ? B_ : A_.transpose(0, 1);
@@ -64,26 +71,34 @@ void gemm_out(const at::Tensor& A_, const at::Tensor& B_, at::Tensor out,
   TORCH_CHECK(B.stride(0) == 1 || B.stride(1) == 1, "Input must be contiguous in dim 0 or dim 1");
   bool A_rowmajor = A.stride(1) == 1;
   bool B_rowmajor = B.stride(1) == 1;
-  TORCH_CHECK(out.scalar_type() == input_type || out.scalar_type() == at::ScalarType::Float, "out must be of the same type as A and B, or of type FP32");
-  TORCH_CHECK(out.is_cuda());
-  if (C_rowmajor) { out = out.transpose(0, 1); }  // Now out is colmajor
-  CHECK_SHAPE(out, m, n);
-  TORCH_CHECK(out.stride(0) == 1);
-  auto out_type = out.scalar_type();
+
   at::Tensor C;
   if (C_.has_value()) {
     C = C_.value();
-    TORCH_CHECK(C.scalar_type() == out_type, "C must be of the same type as out");
+    TORCH_CHECK(C.scalar_type() == input_type || C.scalar_type() == at::ScalarType::Float, "C must be of the same type as A and B, or of type FP32");
     TORCH_CHECK(C.is_cuda());
     if (C_rowmajor) { C = C.transpose(0, 1); }  // Now C is colmajor
     CHECK_SHAPE(C, m, n);
     TORCH_CHECK(C.stride(0) == 1);
   }
 
+  at::Tensor out;
+  auto opts = A.options();
+  if (!out_.has_value()) {
+    auto out_type = C_.has_value() ? C_.value().scalar_type() : out_dtype_.value_or(input_type);
+    out = at::empty({n, m}, opts.dtype(out_type)).transpose(0, 1);  // Colmajor
+  } else {
+    out = out_.value();
+    TORCH_CHECK(out.scalar_type() == input_type || out.scalar_type() == at::ScalarType::Float, "out must be of the same type as A and B, or of type FP32");
+    TORCH_CHECK(out.is_cuda());
+    if (C_rowmajor) { out = out.transpose(0, 1); }  // Now out is colmajor
+    CHECK_SHAPE(out, m, n);
+    TORCH_CHECK(out.stride(0) == 1);
+  }
+  auto out_type = out.scalar_type();
+
   // Otherwise the kernel will be launched from cuda:0 device
   at::cuda::CUDAGuard device_guard{A.device()};
-
-  auto opts = A.options();
 
   size_t workspaceSize = 1024 * 1024 * (at::cuda::getCurrentDeviceProperties()->major >= 9 ? 32 : 4);
   auto lt_workspace = at::empty({static_cast<int64_t>(workspaceSize)}, opts.dtype(torch::kUInt8));
@@ -128,12 +143,16 @@ void gemm_out(const at::Tensor& A_, const at::Tensor& B_, at::Tensor out,
   TORCH_CUDABLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(&preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, &c_alignment, sizeof(c_alignment)));
   TORCH_CUDABLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(&preference, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, &d_alignment, sizeof(d_alignment)));
 
-  cublasLtMatmulHeuristicResult_t heuristicResult = {};
-  int returnedResult = 0;
-  TORCH_CUDABLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(
-    ltHandle, &operationDesc, &Adesc, &Bdesc, &Cdesc, &Ddesc, &preference,
-    1 /*requestedAlgoCount*/, &heuristicResult, &returnedResult));
-  if (returnedResult == 0) { TORCH_CUDABLAS_CHECK(CUBLAS_STATUS_NOT_SUPPORTED); }
+  constexpr int requestedAlgoCount = 8;
+  cublasLtMatmulHeuristicResult_t heuristicResult[requestedAlgoCount] = { 0 };
+  if (heuristic >= 0) {  // If heuristic == -1 we don't query
+    int returnedResult = 0;
+    TORCH_CUDABLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(
+      ltHandle, &operationDesc, &Adesc, &Bdesc, &Cdesc, &Ddesc, &preference,
+      requestedAlgoCount, heuristicResult, &returnedResult));
+    if (returnedResult == 0) { TORCH_CUDABLAS_CHECK(CUBLAS_STATUS_NOT_SUPPORTED); }
+    heuristic = std::min(heuristic, returnedResult - 1);
+  }
   TORCH_CUDABLAS_CHECK(cublasLtMatmul(
     ltHandle,
     &operationDesc,
@@ -147,42 +166,20 @@ void gemm_out(const at::Tensor& A_, const at::Tensor& B_, at::Tensor out,
     &Cdesc,
     out_ptr,
     &Ddesc,
-    &heuristicResult.algo,
+    heuristic >= 0 ? &heuristicResult[heuristic].algo : nullptr,
     (void*) (lt_workspace.data_ptr()),
     workspaceSize,
     c10::cuda::getCurrentCUDAStream()));
+  // torch.library doesn't like returning a tensor that aliases an input tensor, so we return None
+  // if out was provided.
+  return !out_.has_value() ? (C_rowmajor ? out.transpose(0, 1) : out) : at::Tensor{};
 }
-
-at::Tensor gemm_t(const at::Tensor& A, const at::Tensor& B, std::optional<at::ScalarType> out_dtype_) {
-  at::ScalarType out_type = out_dtype_.value_or(A.scalar_type());
-  at::Tensor out = at::empty({A.size(1), B.size(1)}, A.options().dtype(out_type));
-  gemm_out(A.transpose(0, 1), B, out, std::nullopt);
-  return out;
-}
-
-
-at::Tensor gemm_t_add(const at::Tensor& A, const at::Tensor& B, at::Tensor C) {
-  at::Tensor out = at::empty({A.size(1), B.size(1)}, C.options());
-  gemm_out(A.transpose(0, 1), B, out, C);
-  return out;
-}
-
-void gemm_t_add_(const at::Tensor& A, const at::Tensor& B, at::Tensor C) {
-  gemm_out(A.transpose(0, 1), B, C, C);
-}
-
 
 TORCH_LIBRARY(gemm_cublas, m) {
-  m.def("gemm_out(Tensor A, Tensor B, Tensor(a!) out, Tensor? C=None) -> ()");
-  m.def("gemm_t(Tensor A, Tensor B, ScalarType? out_dtype=None) -> Tensor");
-  m.def("gemm_t_add(Tensor A, Tensor B, Tensor C) -> Tensor");
-  m.def("gemm_t_add_(Tensor A, Tensor B, Tensor(a!) C) -> ()");
+  m.def("gemm_impl(Tensor A, Tensor B, Tensor? C=None, Tensor(a!)? out=None, ScalarType? out_dtype=None, int heuristic=-1) -> Tensor");
 }
 
 // Registers CUDA implementations
 TORCH_LIBRARY_IMPL(gemm_cublas, CUDA, m) {
-  m.impl("gemm_out", &gemm_out);
-  m.impl("gemm_t", &gemm_t);
-  m.impl("gemm_t_add", &gemm_t_add);
-  m.impl("gemm_t_add_", &gemm_t_add_);
+  m.impl("gemm_impl", &gemm_impl);
 }
