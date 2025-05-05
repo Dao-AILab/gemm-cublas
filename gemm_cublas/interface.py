@@ -7,6 +7,10 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.amp import custom_bwd, custom_fwd
 
+from gemm_cublas.autotuner import autotune, AutotuneConfig
+
+NUM_AUTOTUNE_HEURISTICS = 8
+
 
 @torch.library.register_fake("gemm_cublas::gemm_impl")
 def gemm_impl_ref(
@@ -80,14 +84,49 @@ def gemm_ref(A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None) -> T
     return torch.mm(A, B).to(out_dtype if out_dtype is not None else A.dtype)
 
 
+@autotune(configs=[AutotuneConfig(heuristic=i) for i in range(NUM_AUTOTUNE_HEURISTICS)])
+def gemm_tuned_impl(A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None,
+                    heuristic: int = -1) -> Tensor:
+    return gemm_out(A, B, out_dtype=out_dtype, heuristic=heuristic)
+
+
+@torch.library.custom_op("gemm_cublas::gemm_tuned", mutates_args={})
+def gemm_tuned(A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None) -> Tensor:
+    return gemm_tuned_impl(A, B, out_dtype=out_dtype)
+
+
+@torch.library.register_fake("gemm_cublas::gemm_tuned")
+def gemm_tuned_ref(A: Tensor, B: Tensor, out_dtype: Optional[torch.dtype] = None) -> Tensor:
+    return gemm_ref(A, B, out_dtype=out_dtype)
+
+
+# from torch._inductor.lowering import add_layout_constraint
+# add_layout_constraint(torch.ops.gemm_cublas.gemm_not.default, None)
+
+
 @torch.library.custom_op("gemm_cublas::gemm_add", mutates_args={})
 def gemm_add(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
-    return gemm_out(A.T, B, C)
+    return gemm_out(A, B, C)
 
 
 @torch.library.register_fake("gemm_cublas::gemm_add")
 def gemm_add_ref(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
     return C + torch.mm(A, B).to(C.dtype)
+
+
+@autotune(configs=[AutotuneConfig(heuristic=i) for i in range(NUM_AUTOTUNE_HEURISTICS)])
+def gemm_add_tuned_impl(A: Tensor, B: Tensor, C: Tensor, heuristic: int = -1) -> Tensor:
+    return gemm_out(A, B, C, heuristic=heuristic)
+
+
+@torch.library.custom_op("gemm_cublas::gemm_add_tuned", mutates_args={})
+def gemm_add_tuned(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
+    return gemm_add_tuned_impl(A, B, C)
+
+
+@torch.library.register_fake("gemm_cublas::gemm_add_tuned")
+def gemm_add_tuned_ref(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
+    return gemm_add_ref(A, B, C)
 
 
 @torch.library.custom_op("gemm_cublas::gemm_add_", mutates_args={"C"},
@@ -99,6 +138,23 @@ def gemm_add_(A: Tensor, B: Tensor, C: Tensor) -> ():  # In-place, will modify C
 @torch.library.register_fake("gemm_cublas::gemm_add_")
 def gemm_add_inplace_ref(A: Tensor, B: Tensor, C: Tensor) -> ():
     C.add_(torch.mm(A, B).to(C.dtype))
+
+
+@autotune(configs=[AutotuneConfig(heuristic=i) for i in range(NUM_AUTOTUNE_HEURISTICS)],
+          restore_value="C")
+def gemm_add_inplace_tuned_impl(A: Tensor, B: Tensor, C: Tensor, heuristic: int = -1) -> ():
+    gemm_out(A, B, C, out=C, heuristic=heuristic)
+
+
+@torch.library.custom_op("gemm_cublas::gemm_add_tuned_", mutates_args={"C"},
+                         schema="(Tensor A, Tensor B, Tensor(a!) C) -> ()")
+def gemm_add_inplace_tuned(A: Tensor, B: Tensor, C: Tensor) -> ():  # In-place, will modify C
+    gemm_add_inplace_tuned_impl(A, B, C)
+
+
+@torch.library.register_fake("gemm_cublas::gemm_add_tuned_")
+def gemm_add_inplace_tuned_ref(A: Tensor, B: Tensor, C: Tensor) -> ():
+    gemm_add_inplace_ref(A, B, C)
 
 
 try:
